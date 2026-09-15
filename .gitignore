@@ -1,0 +1,5 @@
+# Build output
+ClaudeStatus.app/
+
+# macOS noise
+.DS_Store
