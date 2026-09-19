@@ -222,6 +222,13 @@ struct ModelBalance {
 
 /// ZCode's desktop app caches plan balance snapshots in its main window's
 /// localStorage (leveldb). We scan those files for the newest snapshot JSON.
+/// Key prefix changed in ZCode 3.14 (subscription-v2); the old one is kept as
+/// a fallback for older installs.
+let balanceKeyPrefixes = [
+    "zcode:usage-entitlement:subscription-v2:account:zai-start-plan",
+    "zcode:usage-entitlement:builtin:zai-start-plan",
+]
+
 let balanceStorageDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/ZCode/session/Local Storage/leveldb")
 
@@ -234,39 +241,43 @@ func balanceSnapshot() -> [String: ModelBalance] {
     for name in files where name.hasSuffix(".log") || name.hasSuffix(".ldb") {
         guard let raw = fm.contents(atPath: balanceStorageDir.appendingPathComponent(name).path) else { continue }
         let text = String(decoding: raw, as: UTF8.self)
-        var searchStart = text.startIndex
-        while let keyRange = text.range(of: "zcode:usage-entitlement:builtin:zai-start-plan",
-                                        range: searchStart..<text.endIndex) {
-            // The JSON blob follows the storage key.
-            guard let jsonStart = text.range(of: "{\"cachedAt\":", range: keyRange.upperBound..<text.endIndex) else { break }
-            // Balanced-brace scan for the full snapshot object.
-            var depth = 0
-            var index = jsonStart.lowerBound
-            var inString = false
-            var escaped = false
-            while index < text.endIndex {
-                let ch = text[index]
-                if escaped { escaped = false }
-                else if ch == "\\" && inString { escaped = true }
-                else if ch == "\"" { inString.toggle() }
-                else if !inString {
-                    if ch == "{" { depth += 1 }
-                    else if ch == "}" {
-                        depth -= 1
-                        if depth == 0 {
-                            let jsonText = String(text[jsonStart.lowerBound...index])
-                            if let obj = try? JSONSerialization.jsonObject(with: Data(jsonText.utf8)) as? [String: Any],
-                               let cachedAt = obj["cachedAt"] as? Int64, cachedAt > bestCachedAt {
-                                bestCachedAt = cachedAt
-                                bestJSON = obj
+        for prefix in balanceKeyPrefixes {
+            var searchStart = text.startIndex
+            while let keyRange = text.range(of: prefix, range: searchStart..<text.endIndex) {
+                // The JSON blob follows the storage key (possibly with an
+                // account-id suffix in between).
+                guard let jsonStart = text.range(of: "{\"cachedAt\":", range: keyRange.upperBound..<text.endIndex) else { break }
+                // Balanced-brace scan for the full snapshot object. Compressed
+                // regions can corrupt this scan; json.loads below rejects the
+                // broken ones, and a clean copy always exists in a newer file.
+                var depth = 0
+                var index = jsonStart.lowerBound
+                var inString = false
+                var escaped = false
+                while index < text.endIndex {
+                    let ch = text[index]
+                    if escaped { escaped = false }
+                    else if ch == "\\" && inString { escaped = true }
+                    else if ch == "\"" { inString.toggle() }
+                    else if !inString {
+                        if ch == "{" { depth += 1 }
+                        else if ch == "}" {
+                            depth -= 1
+                            if depth == 0 {
+                                let jsonText = String(text[jsonStart.lowerBound...index])
+                                if let obj = try? JSONSerialization.jsonObject(with: Data(jsonText.utf8)) as? [String: Any],
+                                   let cachedAt = obj["cachedAt"] as? Int64, cachedAt > bestCachedAt {
+                                    bestCachedAt = cachedAt
+                                    bestJSON = obj
+                                }
+                                break
                             }
-                            break
                         }
                     }
+                    index = text.index(after: index)
                 }
-                index = text.index(after: index)
+                searchStart = index > jsonStart.lowerBound ? index : keyRange.upperBound
             }
-            searchStart = index > jsonStart.lowerBound ? index : keyRange.upperBound
         }
     }
 
@@ -295,24 +306,58 @@ func balanceSnapshot() -> [String: ModelBalance] {
     return byModel
 }
 
-/// Latest model selected in any ZCode session, from today's jsonl log.
+/// Model ids appear in several shapes across versions (`account:plan/NAME`,
+/// `provider/cl/z-ai/glm-5.3-flash`, plain `NAME`); normalize to display names.
+let knownModelNames = ["GLM-5.3-Flash", "GLM-5.3", "GLM-5-Turbo"]
+
+func normalizeModelName(_ raw: String) -> String {
+    var name = raw
+    if let slash = name.lastIndex(of: "/") {
+        name = String(name[name.index(after: slash)...])
+    }
+    if let colon = name.lastIndex(of: ":") {
+        name = String(name[name.index(after: colon)...])
+    }
+    return knownModelNames.first { $0.caseInsensitiveCompare(name) == .orderedSame } ?? name
+}
+
+/// The model the current/last task is using. ZCode 3.14 removed model ids
+/// from most log events, so the primary source is the usage db's latest
+/// main_turn row (clean display name); the log is a fallback with growing
+/// read windows for quiet tails.
 func fetchCurrentModel() -> String {
+    let dbModel = sqliteQuery("""
+    SELECT model_id FROM model_usage WHERE query_source='main_turn'
+    ORDER BY started_at DESC LIMIT 1;
+    """).trimmingCharacters(in: .whitespacesAndNewlines)
+    if !dbModel.isEmpty, !dbModel.hasPrefix("sqlite"), dbModel != "(null)" {
+        return normalizeModelName(dbModel)
+    }
+
     let url = todayLogPath()
     guard let handle = try? FileHandle(forReadingFrom: url) else { return "unknown" }
     defer { try? handle.close() }
     let size = (try? handle.seekToEnd()) ?? 0
-    let window: UInt64 = 400_000
-    try? handle.seek(toOffset: size > window ? size - window : 0)
-    guard let data = try? handle.readToEnd(),
-          let text = String(data: data, encoding: .utf8) else { return "unknown" }
-    guard let eventRange = text.range(of: "\"event\":\"session.model.updated\"",
-                                      options: .backwards) else { return "unknown" }
-    let tail = String(text[eventRange.lowerBound...])
-    guard let modelRange = tail.range(of: "\"model\":\"") else { return "unknown" }
-    let afterQuote = tail[modelRange.upperBound...]
-    if let end = afterQuote.firstIndex(of: "\"") {
-        let raw = String(afterQuote[..<end])
-        return raw.split(separator: "/").last.map(String.init) ?? raw
+    for window in [400_000, 2_000_000, UInt64.max] {
+        let effective = min(size, window)
+        try? handle.seek(toOffset: size - effective)
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { continue }
+
+        var fallback: String?
+        for line in text.split(separator: "\n").reversed() {
+            guard let modelRange = line.range(of: "\"model\":\"") else { continue }
+            let afterQuote = line[modelRange.upperBound...]
+            guard let end = afterQuote.firstIndex(of: "\"") else { continue }
+            let normalized = normalizeModelName(String(afterQuote[..<end]))
+            if line.contains("\"querySource\":\"main_turn\"") {
+                return normalized
+            }
+            if fallback == nil { fallback = normalized }
+        }
+        if let fallback, window == 400_000 || fallback != "unknown" {
+            return fallback
+        }
     }
     return "unknown"
 }
@@ -1159,6 +1204,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         renderRows()
         currentModelName = fetchCurrentModel()
         modelLabel.stringValue = currentModelName
+        let glm = lastBalances["GLM-5.3"].map { "\(Int(round($0.percentLeft * 100)))%" } ?? "none"
+        let flash = lastBalances["GLM-5.3-Flash"].map { "\(Int(round($0.percentLeft * 100)))%" } ?? "none"
+        NSLog("ClaudeStatus stats: GLM-5.3=%@ flash=%@ model=%@", glm, flash, currentModelName)
     }
 
     func checkLowBalance() {
